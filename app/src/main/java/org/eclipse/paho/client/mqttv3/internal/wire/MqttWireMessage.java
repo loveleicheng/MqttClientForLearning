@@ -1,6 +1,7 @@
 package org.eclipse.paho.client.mqttv3.internal.wire;
 
 import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttPersistable;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -66,6 +67,12 @@ public abstract class MqttWireMessage {
     }
 
     protected abstract byte[] getVariableHeader() throws MqttException;
+
+    public static MqttWireMessage createWireMessage(MqttPersistable data) throws MqttException {
+
+        return null;
+    }
+
 
     /**
      * 与消息关联的键
