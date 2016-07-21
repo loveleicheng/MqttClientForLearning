@@ -2,7 +2,14 @@ package org.eclipse.paho.client.mqttv3.internal;
 
 import org.eclipse.paho.client.mqttv3.MqttClientPersistence;
 import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.MqttPersistable;
+import org.eclipse.paho.client.mqttv3.MqttPingSender;
+import org.eclipse.paho.client.mqttv3.MqttToken;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttAck;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttConnect;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttPingReq;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubComp;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubRel;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPublish;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttWireMessage;
@@ -53,6 +60,31 @@ public class ClientState {
     private Hashtable outboundQos2 = null;
     private Hashtable outboundQos1 = null;
     private Hashtable inboundQos2 = null;
+
+    private CommsCallback callback = null;
+    private MqttPingSender pingSender = null;
+
+    protected ClientState(MqttClientPersistence persistence, CommsTokenStore tokenStore,
+                          CommsCallback callback, ClientComms clientComms, MqttPingSender pingSender) throws MqttException {
+
+        inUseMsgIds = new Hashtable();
+        pendingMessages = new Vector(this.maxInflight);
+        pendingFlows = new Vector();
+        outboundQos2 = new Hashtable();
+        outboundQos1 = new Hashtable();
+        inboundQos2 = new Hashtable();
+        pingCommand = new MqttPingReq();
+        inFlightPubRels = 0;
+        actualInFlight = 0;
+
+        this.persistence = persistence;
+        this.callback = callback;
+        this.tokenStore = tokenStore;
+        this.clientComms = clientComms;
+        this.pingSender = pingSender;
+
+        restoreState();
+    }
 
     protected void restoreState () throws MqttException {
 
@@ -131,6 +163,121 @@ public class ClientState {
 
     private String getReceivedPersistenceKey(MqttWireMessage message) {
         return PERSISTENCE_RECEIVED_PREFIX + message.getMessageId();
+    }
+
+    protected void clearState() throws MqttException {
+
+        persistence.clear();
+        inUseMsgIds.clear();
+        pendingMessages.clear();
+        pendingFlows.clear();
+        outboundQos2.clear();
+        outboundQos1.clear();
+        inboundQos2.clear();
+        tokenStore.clear();
+    }
+
+    protected void close() {
+        inUseMsgIds.clear();
+        pendingMessages.clear();
+        pendingFlows.clear();
+        outboundQos2.clear();
+        outboundQos1.clear();
+        inboundQos2.clear();
+        tokenStore.clear();
+        inUseMsgIds = null;
+        pendingMessages = null;
+        pendingFlows = null;
+        outboundQos2 = null;
+        outboundQos1 = null;
+        inboundQos2 = null;
+        tokenStore = null;
+        callback = null;
+        clientComms = null;
+        persistence = null;
+        pingCommand = null;
+    }
+
+    private void insertInOrder(Vector list, MqttWireMessage newMsg) {
+        int newMsgId = newMsg.getMessageId();
+        for (int i = 0; i < list.size(); i++) {
+            MqttWireMessage otherMsg = (MqttWireMessage) list.elementAt(i);
+            int otherMsgId = otherMsg.getMessageId();
+            if (otherMsgId > newMsgId) {
+                list.insertElementAt(newMsg, i);
+                return;
+            }
+        }
+        list.addElement(newMsg);
+    }
+
+    public void send (MqttWireMessage message, MqttToken token) throws MqttException {
+
+        if (message.isMessageIdRequired() && message.getMessageId() == 0 ){
+            message.setMessageId(getNextMessageId());
+        }
+
+        if (token != null){
+            try{
+                token.internalToken.setMessageID(message.getMessageId());
+            }catch(Exception e){}
+        }
+
+        if (message instanceof MqttPublish){
+
+            synchronized (queueLock){
+
+                MqttMessage innerMessage = ((MqttPublish)message).getMessage();
+                switch (innerMessage.getQos()){
+                    case 2:
+                        outboundQos2.put(new Integer(message.getMessageId()), message);
+                        persistence.put(getSendPersistenceKey(message), (MqttPublish) message);
+                    break;
+
+                    case 1:
+                        outboundQos1.put(new Integer(message.getMessageId()), message);
+                        persistence.put(getSendPersistenceKey(message), (MqttPublish) message);
+                    break;
+                }
+                tokenStore.saveToken(token, message);
+                pendingMessages.addElement(message);
+                queueLock.notifyAll();
+            }
+
+        }else{
+
+            if (message instanceof MqttConnect){
+                synchronized (queueLock){
+                    tokenStore.saveToken(token, message);
+                    pendingFlows.insertElementAt(message, 0);
+                    queueLock.notifyAll();
+                }
+            }else{
+
+                if (message instanceof MqttPingReq){
+                    this.pingCommand = message;
+                }else if ( message instanceof MqttPubRel ){
+                    outboundQos2.put(new Integer(message.getMessageId()), message);
+                    persistence.put(getSendConfirmPersistenceKey(message), (MqttPubRel)message);
+                }else if (message instanceof MqttPubComp){
+                    persistence.remove(getReceivedPersistenceKey(message));
+                }
+
+                synchronized (queueLock){
+                    if ( ! (message instanceof MqttAck) ){
+                        tokenStore.saveToken(token, message);
+                    }
+                    pendingFlows.addElement(message);
+                    queueLock.notifyAll();
+                }
+            }
+        }
+
+
+    }
+
+    private synchronized int getNextMessageId() throws MqttException {
+        return 0;
     }
 
 }

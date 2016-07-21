@@ -180,6 +180,10 @@ public abstract class MqttWireMessage {
         return PACKET_NAMES[type];
     }
 
+    public boolean isMessageIdRequired() {
+        return true;
+    }
+
 }
 
 
