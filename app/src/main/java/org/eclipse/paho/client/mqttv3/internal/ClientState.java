@@ -4,12 +4,17 @@ import org.eclipse.paho.client.mqttv3.MqttClientPersistence;
 import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.MqttPersistable;
+import org.eclipse.paho.client.mqttv3.MqttPersistenceException;
 import org.eclipse.paho.client.mqttv3.MqttPingSender;
 import org.eclipse.paho.client.mqttv3.MqttToken;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttAck;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttConnack;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttConnect;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPingReq;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttPingResp;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubAck;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubComp;
+import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubRec;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPubRel;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttPublish;
 import org.eclipse.paho.client.mqttv3.internal.wire.MqttWireMessage;
@@ -278,6 +283,353 @@ public class ClientState {
 
     private synchronized int getNextMessageId() throws MqttException {
         return 0;
+    }
+
+    protected void undo (MqttPublish message) throws MqttPersistenceException {
+        synchronized (queueLock){
+
+            if (message.getMessage().getQos() == 1){
+                outboundQos1.remove(new Integer(message.getMessageId()));
+            }else {
+                outboundQos2.remove(new Integer(message.getMessageId()));
+            }
+            pendingMessages.removeElement(message);
+            persistence.remove(getSendPersistenceKey(message));
+            tokenStore.removeToken(message);
+            checkQuiesceLock();
+        }
+    }
+
+    private void decrementInFlight (){
+        synchronized (queueLock){
+            actualInFlight--;
+            if (!checkQuiesceLock()){
+                queueLock.notifyAll();
+            }
+        }
+    }
+    private synchronized void releaseMessageId(int msgId) {
+        inUseMsgIds.remove(new Integer(msgId));
+    }
+
+    protected void notifySent (MqttWireMessage message){
+
+        MqttToken token = tokenStore.getToken(message);
+        token.internalToken.notifySent();
+        if (message instanceof MqttPingReq){
+            //心跳信息更新
+        }else if (message instanceof MqttPublish){
+            if (((MqttPublish)message).getMessage().getQos() == 0){
+                token.internalToken.markComplete(null, null);
+                //callback 回调
+                decrementInFlight();
+                releaseMessageId(message.getMessageId());
+                tokenStore.removeToken(message);
+                checkQuiesceLock();
+            }
+        }
+    }
+
+    protected MqttWireMessage get() throws MqttException{
+        MqttWireMessage result = null;
+        synchronized (queueLock){
+            while (result == null){
+
+                if ( (pendingMessages.isEmpty() && pendingFlows.isEmpty())
+                        || (pendingFlows.isEmpty() && actualInFlight >= maxInflight) ){
+                    try{
+                        queueLock.wait();
+                    }catch (Exception e){}
+                }
+
+                if ( !connected && ( pendingFlows.isEmpty() || !( (MqttWireMessage)pendingFlows.elementAt(0) instanceof MqttConnect ) )){
+                    return null;
+                }
+
+                if (!pendingFlows.isEmpty()){
+                    result = (MqttWireMessage) pendingFlows.remove(0);
+                    if (result instanceof MqttPubRel){
+                        inFlightPubRels++;
+                    }
+                    checkQuiesceLock();
+                }else if (!pendingMessages.isEmpty()){
+                    if (actualInFlight < maxInflight){
+                        result = (MqttWireMessage) pendingMessages.elementAt(0);
+                        pendingMessages.remove(0);
+                        actualInFlight++;
+                    }
+                }
+
+            }
+        }
+        return result;
+    }
+
+    protected boolean checkQuiesceLock() {
+        return true;
+    }
+
+    public void connected (){
+        connected = true;
+        //start ping sender thread
+    }
+
+    protected void notifyReceivedAck (MqttAck ack) throws MqttException {
+
+        MqttToken token = tokenStore.getToken(ack);
+        MqttException mex = null;
+
+        if ( ack instanceof MqttPubRec){
+            // callback.fireActionEvent
+            MqttPubRel rel = new MqttPubRel((MqttPubRec) ack);
+            this.send(rel, token);
+        }else if ( ack instanceof MqttPubAck || ack instanceof  MqttPubComp){
+            notifyResult(ack, token, mex);
+        }else if (ack instanceof MqttPingResp){
+            //ping 相关
+        }else if (ack instanceof MqttConnack){// 连接
+
+            int rc = ((MqttConnack)ack).getReturnCode();
+            if (rc == 0){
+                synchronized (queueLock){
+                    if (cleanSession){
+                        clearState();
+                        tokenStore.saveToken(token, ack);
+                    }
+                    inFlightPubRels = 0;
+                    actualInFlight = 0;
+                    restoreInflightMessages();
+                    connected();
+                }
+
+
+            }else{
+                mex = new MqttException(0);
+                throw mex;
+            }
+
+            //clientComms.connectComplete
+            notifyResult(ack, token, mex);
+            tokenStore.removeToken(ack);
+
+            synchronized (queueLock){
+                queueLock.notifyAll();
+            }
+
+        }else {
+            //订阅 取消订阅
+            notifyResult(ack, token, mex);
+            releaseMessageId(ack.getMessageId());
+            tokenStore.removeToken(ack);
+        }
+
+    }
+
+    protected void notifyReceivedMsg (MqttWireMessage message) throws MqttException {
+        if (!quiescing){
+            if (message instanceof MqttPublish){
+                MqttPublish send = (MqttPublish) message;
+                switch (send.getMessage().getQos()){
+                    case 0:
+                    case 1:
+                        //callback.messageArrived
+                        break;
+                    case 2:
+                        persistence.put(getReceivedPersistenceKey(message), (MqttPublish)message);
+                        inboundQos2.put( new Integer(send.getMessageId()), send);
+                        this.send(new MqttPubRec(send), null);
+                        break;
+                }
+            } else if (message instanceof MqttPubRel){
+                MqttPublish sendMsg = (MqttPublish) inboundQos2.get(new Integer(message.getMessageId()));
+                if (sendMsg != null){
+                    if (callback != null){
+                        //callback messageArrived
+                    }
+                } else {
+                    MqttPubComp pubComp = new MqttPubComp(message.getMessageId());
+                    this.send(pubComp, null);
+                }
+            }
+        }
+    }
+
+    protected void notifyComplete (MqttToken token) throws MqttException {
+        MqttWireMessage message = token.internalToken.getWireMessage();
+
+        if ( message != null && message instanceof MqttAck ){
+
+            MqttAck ack = (MqttAck) message;
+
+            if (ack instanceof MqttPubAck){
+                persistence.remove(getSendPersistenceKey(message));
+                outboundQos1.remove(new Integer(ack.getMessageId()));
+                decrementInFlight();
+                releaseMessageId(message.getMessageId());
+                tokenStore.removeToken(message);
+
+            } else if ( ack instanceof MqttPubComp ){
+
+                persistence.remove(getSendPersistenceKey(message));
+                persistence.remove(getSendConfirmPersistenceKey(message));
+                outboundQos2.remove(new Integer(ack.getMessageId()));
+
+                inFlightPubRels--;
+                decrementInFlight();
+                releaseMessageId(message.getMessageId());
+                tokenStore.removeToken(message);
+            }
+
+            checkQuiesceLock();
+        }
+    }
+
+    protected void notifyResult (MqttWireMessage ack, MqttToken token, MqttException ex){
+
+        if ( ack != null && ack instanceof MqttPubAck && !( ack instanceof MqttPubRec ) ){
+
+            //callback asyncOperationComplete
+        }
+
+        if ( ack == null ){
+            //callback asyncOperationComplete
+        }
+
+    }
+
+    public void disconnected (MqttException reason){
+
+        this.connected = false;
+        try{
+            if (cleanSession){
+                clearState();
+            }
+            pendingMessages.clear();
+            pendingFlows.clear();
+            synchronized (pingOutstandingLock){
+                pingOutstanding = 0;
+            }
+
+        }catch (Exception e){
+
+        }
+
+    }
+
+    private Vector reOrder(Vector list) {
+
+        // here up the new list
+        Vector newList = new Vector();
+
+        if (list.size() == 0) {
+            return newList; // nothing to reorder
+        }
+
+        int previousMsgId = 0;
+        int largestGap = 0;
+        int largestGapMsgIdPosInList = 0;
+        for (int i = 0; i < list.size(); i++) {
+            int currentMsgId = ((MqttWireMessage) list.elementAt(i)).getMessageId();
+            if (currentMsgId - previousMsgId > largestGap) {
+                largestGap = currentMsgId - previousMsgId;
+                largestGapMsgIdPosInList = i;
+            }
+            previousMsgId = currentMsgId;
+        }
+        int lowestMsgId = ((MqttWireMessage) list.elementAt(0)).getMessageId();
+        int highestMsgId = previousMsgId; // last in the sorted list
+
+        // we need to check that the gap after highest msg id to the lowest msg id is not beaten
+        if (MAX_MSG_ID - highestMsgId + lowestMsgId > largestGap) {
+            largestGapMsgIdPosInList = 0;
+        }
+
+        // starting message has been located, let's start from this point on
+        for (int i = largestGapMsgIdPosInList; i < list.size(); i++) {
+            newList.addElement(list.elementAt(i));
+        }
+
+        // and any wrapping back to the beginning
+        for (int i = 0; i < largestGapMsgIdPosInList; i++) {
+            newList.addElement(list.elementAt(i));
+        }
+
+        return newList;
+    }
+
+    private void restoreInflightMessages() {
+
+        final String methodName = "restoreInflightMessages";
+        pendingMessages = new Vector(this.maxInflight);
+        pendingFlows = new Vector();
+
+        Enumeration keys = outboundQos2.keys();
+        while (keys.hasMoreElements()) {
+            Object key = keys.nextElement();
+            Object msg = outboundQos2.get(key);
+            if (msg instanceof MqttPublish) {
+                //@TRACE 610=QoS 2 publish key={0}
+
+                insertInOrder(pendingMessages, (MqttPublish)msg);
+            } else if (msg instanceof MqttPubRel) {
+                //@TRACE 611=QoS 2 pubrel key={0}
+
+                insertInOrder(pendingFlows, (MqttPubRel)msg);
+            }
+        }
+        keys = outboundQos1.keys();
+        while (keys.hasMoreElements()) {
+            Object key = keys.nextElement();
+            MqttPublish msg = (MqttPublish)outboundQos1.get(key);
+            //@TRACE 612=QoS 1 publish key={0}
+
+            insertInOrder(pendingMessages, msg);
+        }
+
+        this.pendingFlows = reOrder(pendingFlows);
+        this.pendingMessages = reOrder(pendingMessages);
+
+    }
+
+    public void notifyQueueLock() {
+        synchronized (queueLock) {
+            queueLock.notifyAll();
+        }
+    }
+
+    public void quiesce(long timeout) {
+        if (timeout > 0 ) {
+            synchronized (queueLock) {
+                this.quiescing = true;
+            }
+            //callback.quiesce();
+            notifyQueueLock();
+
+            synchronized (quiesceLock) {
+                try {
+                    int tokc = tokenStore.count();
+                    if (tokc > 0 || pendingFlows.size() >0 /*|| !callback.isQuiesced() */) {
+
+                        quiesceLock.wait(timeout);
+                    }
+                }
+                catch (InterruptedException ex) {
+                }
+            }
+
+            synchronized (queueLock) {
+                pendingMessages.clear();
+                pendingFlows.clear();
+                quiescing = false;
+                actualInFlight = 0;
+            }
+        }
+    }
+
+    protected void deliveryComplete(MqttPublish message) throws MqttPersistenceException {
+
+        persistence.remove(getReceivedPersistenceKey(message));
+        inboundQos2.remove(new Integer(message.getMessageId()));
     }
 
 }
